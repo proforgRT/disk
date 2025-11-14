@@ -1,0 +1,297 @@
+import os
+import json
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from pathlib import Path
+from typing import List, Dict, Any
+import torch
+import torchvision
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+from ultralytics import YOLO
+from sklearn.model_selection import train_test_split
+from PIL import Image
+import yaml  # Для возможной обработки YAML, хотя здесь это не центрально
+
+
+# Симулированный класс RadarImage (замените на реальный импорт из mkc_rli_loader)
+class RadarImage:
+    @staticmethod
+    def get_all_data():
+        # Заглушка: Загрузка полного набора rli_images из PGSQL в DataFrame
+        # В реальности: Подключение к PGSQL и запрос всех строк
+        return pd.DataFrame()  # Замените на реальную загрузку
+
+    @staticmethod
+    def get_row_by_id(indices: List[int]):
+        # Заглушка: Загрузка конкретных строк по ID
+        # В реальности: Запрос к PGSQL по заданным индексам
+        return pd.DataFrame()  # Замените на реальную загрузку
+
+
+class Models:
+    """Обработка всего, что связано с моделями, включая загрузку."""
+
+    @staticmethod
+    def get_my_models() -> List[Any]:
+        """Статический метод для загрузки каждой модели в список. Без аргументов. Возвращает список объектов моделей."""
+        models_dir = './trained_models/'
+        model_list = []
+
+        # Загрузка модели YOLO (предполагаем обученные веса yolov8n)
+        try:
+            yolo_model = YOLO(os.path.join(models_dir, 'yolov8n_trained.pt'))
+            model_list.append(('yolo', yolo_model))
+        except FileNotFoundError:
+            print("Веса YOLO не найдены; пропускаем.")
+
+        # Загрузка модели FasterRCNN
+        try:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            frcnn_model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+            # Предполагаем num_classes из контекста; скорректируйте nc по необходимости (например, из Excel)
+            nc = 10  # Заглушка; получите из get_class_types_from_excel
+            in_features = frcnn_model.roi_heads.box_predictor.cls_score.in_features
+            frcnn_model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, nc)
+            frcnn_model.load_state_dict(torch.load(os.path.join(models_dir, 'frcnn_trained.pth'), map_location=device, weights_only=False))
+            frcnn_model.to(device)
+            frcnn_model.eval()
+            model_list.append(('frcnn', frcnn_model))
+        except FileNotFoundError:
+            print("Веса FRCNN не найдены; пропускаем.")
+
+        # Загрузка классификатора ResNet (для классификации bbox после детекции)
+        try:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            resnet_model = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)
+            nc = 10  # Заглушка
+            num_ftrs = resnet_model.fc.in_features
+            resnet_model.fc = torch.nn.Linear(num_ftrs, nc)
+            resnet_model.load_state_dict(torch.load(os.path.join(models_dir, 'resnet_trained.pth'), map_location=device, weights_only=False))
+            resnet_model.to(device)
+            resnet_model.eval()
+            model_list.append(('resnet', resnet_model))
+        except FileNotFoundError:
+            print("Веса ResNet не найдены; пропускаем.")
+
+        print(f"Загружено {len(model_list)} моделей.")
+        return model_list
+
+
+class Plots:
+    """Обработка всего, что связано с отображением, аннотациями и обработкой."""
+
+    @staticmethod
+    def plot_eval_model(image: np.ndarray, true_bboxes: Dict, pred_bboxes: Dict, save_path: str = None, metric_thresh: float = 0.5) -> float:
+        """Сохранение изображения с истинными и предсказанными bbox. Аргументы: image (numpy), true_bboxes/pred_bboxes (dict {obj_id: [x,y,w,h]}), возвращает метрику (средний IoU)."""
+        if save_path is None:
+            save_path = './result/eval_plot.png'
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        fig, ax = plt.subplots(1, figsize=(12, 8))
+        ax.imshow(image)
+
+        # Отрисовка истинных bbox (зеленые)
+        for obj_id, bbox in true_bboxes.items():
+            x, y, w, h = bbox  # Предполагаем, что dict хранит [x,y,w,h]
+            rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor='green', facecolor='none', label='Истинные' if obj_id == 0 else "")
+            ax.add_patch(rect)
+
+        # Отрисовка предсказанных bbox (красные)
+        for obj_id, bbox in pred_bboxes.items():
+            x, y, w, h = bbox
+            rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor='red', facecolor='none', label='Предсказанные' if obj_id == 0 else "")
+            ax.add_patch(rect)
+
+        ax.legend()
+        plt.axis('off')
+        plt.savefig(save_path, bbox_inches='tight', dpi=150)
+        plt.close()
+
+        # Вычисление среднего IoU как метрики
+        iou_scores = []
+        for true_id, true_box in true_bboxes.items():
+            best_iou = 0
+            for pred_id, pred_box in pred_bboxes.items():
+                iou_val = Plots._iou(true_box[:4], pred_box[:4])  # Используем первые 4 для [x,y,w,h]
+                best_iou = max(best_iou, iou_val)
+            iou_scores.append(best_iou)
+        avg_iou = np.mean(iou_scores) if iou_scores else 0.0
+        return avg_iou
+
+    @staticmethod
+    def _iou(boxA, boxB):
+        """Вспомогательный метод для расчета IoU."""
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+        interW = max(0, xB - xA)
+        interH = max(0, yB - yA)
+        interArea = interW * interH
+        boxAArea = boxA[2] * boxA[3]
+        boxBArea = boxB[2] * boxB[3]
+        union = boxAArea + boxBArea - interArea
+        return interArea / union if union > 0 else 0.0
+
+    @staticmethod
+    def get_class_types_from_excel(excel_path: str) -> Dict[str, Any]:
+        """Обработка таблицы Excel с классами/типами. Выход: dict с цепочкой class-type-kind-model и номером модели."""
+        df = pd.read_excel(excel_path)
+        # Предполагаем столбцы: 'class', 'type', 'kind', 'model', 'model_num'
+        class_dict = {}
+        for _, row in df.iterrows():
+            key = f"{row['class']}_{row['type']}_{row['kind']}_{row['model']}"
+            class_dict[key] = row['model_num']
+        return class_dict
+
+    @staticmethod
+    def get_coco_from_pandas(df: pd.DataFrame, class_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Создание dict аннотаций COCO из таблицы pandas PGSQL и обработанного dict Excel."""
+        coco = {
+            "images": [],
+            "annotations": [],
+            "categories": []
+        }
+
+        # Построение категорий из class_dict (упрощено)
+        cat_id = 1
+        for key, model_num in class_dict.items():
+            parts = key.split('_')
+            coco["categories"].append({
+                "id": cat_id,
+                "name": f"{parts[0]}_{parts[1]}_{parts[2]}",  # class_type_kind
+                "supercategory": parts[3]  # model
+            })
+            cat_id += 1
+
+        # Построение изображений и аннотаций из df (предполагаем столбцы: image_id, file_name, bbox [x,y,w,h], category_key)
+        image_id_map = {}
+        for idx, row in df.iterrows():
+            img_name = row['file_name']
+            if img_name not in image_id_map:
+                img_id = len(coco["images"]) + 1
+                image_id_map[img_name] = img_id
+                coco["images"].append({
+                    "id": img_id,
+                    "file_name": img_name,
+                    "width": 640,  # Заглушка; получите из реального изображения
+                    "height": 480
+                })
+
+            # Аннотация
+            cat_key = row['category_key']
+            cat_id = [c['id'] for c in coco["categories"] if cat_key in c['name']][0] if any(cat_key in c['name'] for c in coco["categories"]) else 1
+            bbox = row['bbox'].tolist() if isinstance(row['bbox'], np.ndarray) else row['bbox']
+            coco["annotations"].append({
+                "id": len(coco["annotations"]) + 1,
+                "image_id": image_id_map[img_name],
+                "category_id": cat_id,
+                "bbox": bbox,
+                "area": bbox[2] * bbox[3],
+                "iscrowd": 0
+            })
+
+        # Сохранение в JSON при необходимости
+        with open('coco_annotations.json', 'w', encoding='utf-8') as f:
+            json.dump(coco, f, indent=2)
+
+        return coco
+
+
+def evaluate_model_on_df(model_name: str, model_obj: Any, df: pd.DataFrame, class_dict: Dict, is_trained: bool = True) -> Dict[str, float]:
+    """Выполнение инференса и оценки на DataFrame, возврат dict метрик."""
+    # Заглушка инференса: Для YOLO/FRCNN запустить predict; для ResNet классифицировать кропы
+    # Здесь симулируем случайными предсказаниями для структуры; реализуйте реальный инференс
+    metrics = {'avg_iou': 0.5, 'mAP': 0.7}  # Из реальной COCO-оценки или IoU
+    if is_trained:
+        # Использовать обученную модель для предсказаний
+        pass
+    else:
+        # Использовать базовую предобученную
+        pass
+
+    # Сохранение таблицы/изображения статистики
+    stats_df = pd.DataFrame([metrics])
+    stats_df.to_csv(f'./result/{model_name}_{"trained" if is_trained else "untrained"}_metrics.csv', index=False)
+    return metrics
+
+
+if __name__ == '__main__':
+    # 0. Создание директорий
+    os.makedirs('models_eval', exist_ok=True)
+    os.makedirs('trained_models_eval', exist_ok=True)
+    os.makedirs('result', exist_ok=True)
+
+    # 1. Загрузка rli_images из PGSQL
+    # Для теста: Использовать малые индексы
+    test_indices = [1, 2, 3, 5]  # Малый список для тестирования
+    rli_images = RadarImage.get_row_by_id(test_indices)  # Или get_all_data() для полного
+    # Добавление столбцов
+    rli_images['eval_before_train'] = [{} for _ in range(len(rli_images))]
+    rli_images['eval_after_train'] = [{} for _ in range(len(rli_images))]
+
+    # Предполагаемый путь к Excel; скорректируйте
+    excel_path = './classes_types.xlsx'
+    class_dict = Plots.get_class_types_from_excel(excel_path)
+
+    # 2. Разделение на ОН (train) и ТН (test/val)
+    train_df, test_df = train_test_split(rli_images, test_size=0.2, random_state=42)
+    print(f"ОН: {len(train_df)}, ТН: {len(test_df)}")
+
+    # 3. Создание аннотаций
+    train_coco = Plots.get_coco_from_pandas(train_df, class_dict)
+    test_coco = Plots.get_coco_from_pandas(test_df, class_dict)
+
+    # Сохранение JSON COCO
+    with open('./train_coco.json', 'w') as f:
+        json.dump(train_coco, f)
+    with open('./test_coco.json', 'w') as f:
+        json.dump(test_coco, f)
+
+    # 4. Загрузка моделей
+    my_models = Models.get_my_models()
+
+    # Конфиг: Цикл по каждой модели
+    best_model_name = None
+    best_metric = 0.0
+    for model_name, model_obj in my_models:
+        print(f"Оценка {model_name}...")
+
+        # 5. Статистическая оценка на тестовом наборе (обученная и необученная)
+        untrained_metrics = evaluate_model_on_df(model_name, model_obj, test_df, class_dict, is_trained=False)
+        trained_metrics = evaluate_model_on_df(model_name, model_obj, test_df, class_dict, is_trained=True)
+
+        # Сохранение в столбцах
+        for idx in test_df.index:
+            rli_images.at[idx, 'eval_before_train'][model_name] = untrained_metrics
+            rli_images.at[idx, 'eval_after_train'][model_name] = trained_metrics
+
+        # Определение лучшей по средней mAP или IoU
+        if trained_metrics.get('mAP', 0) > best_metric:
+            best_metric = trained_metrics.get('mAP', 0)
+            best_model_name = model_name
+
+        # Пример сюжета для одного изображения (предполагаем, что первая строка имеет numpy изображения; загрузите реальное)
+        # sample_img = np.array(Image.open(test_df.iloc[0]['file_name']))
+        # true_bboxes = {'1': [100, 100, 50, 50]}  # Из df
+        # pred_bboxes = {'1': [105, 105, 50, 50]}  # Из инференса
+        # Plots.plot_eval_model(sample_img, true_bboxes, pred_bboxes)
+
+    print(f"Лучшая модель: {best_model_name} с метрикой {best_metric}")
+
+    # 6. Загрузка больших сцен (сгенерированных в Unity)
+    large_indices = [1001, 1002, 1003]  # Ваш список ID сцен с множеством объектов
+    rli_images = RadarImage.get_row_by_id(large_indices)
+    large_coco = Plots.get_coco_from_pandas(rli_images, class_dict)
+    with open('./large_coco.json', 'w') as f:
+        json.dump(large_coco, f)
+
+    # 7. Оценка лучшей модели на больших сценах
+    if best_model_name:
+        best_model = next(m for n, m in my_models if n == best_model_name)
+        large_metrics = evaluate_model_on_df(best_model_name, best_model, rli_images, class_dict, is_trained=True)
+        print(f"Оценка больших сцен: {large_metrics}")
+        # Сохранение обновленного rli_images с оценками
+        rli_images.to_pickle('./result/eval_results.pkl')
