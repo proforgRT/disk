@@ -1,0 +1,607 @@
+# sar_detection_pipeline.py
+from __future__ import annotations
+
+import os
+import json
+import math
+import random
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torchvision
+from torchvision.ops import box_iou
+
+# Опционально для отрисовки (можно заменить на PIL)
+import cv2
+
+
+# ---------------------------
+# Конфиг / константы
+# ---------------------------
+classes = ["car", "tank", "other"]
+num_classes = len(classes)                  # как вы просили
+num_classes_with_bg = num_classes + 1       # для torchvision detection: + background(0)
+
+CLASS_TO_ID = {c: i + 1 for i, c in enumerate(classes)}  # 1..K, 0 — background
+ID_TO_CLASS = {v: k for k, v in CLASS_TO_ID.items()}
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Пути к вашим локальным весам (переименуйте под свои файлы)
+LOCAL_WEIGHTS = {
+    "frcnn_resnet50_fpn": "weights/fasterrcnn_resnet50_fpn_coco.pth",
+    "ssd300_vgg16": "weights/ssd300_vgg16_coco.pth",
+    "retinanet_resnet50_fpn": "weights/retinanet_resnet50_fpn_coco.pth",
+}
+
+
+# ---------------------------
+# Утилиты bbox / метрики
+# ---------------------------
+def ensure_3ch_float01(img: np.ndarray) -> torch.Tensor:
+    """
+    img: np.ndarray HxW или HxWxC (SAR обычно 1 канал)
+    -> torch.Tensor float32 (3,H,W) в [0,1]
+    """
+    if img.ndim == 2:
+        img3 = np.stack([img, img, img], axis=-1)
+    elif img.ndim == 3 and img.shape[2] == 1:
+        img3 = np.repeat(img, 3, axis=2)
+    else:
+        img3 = img
+
+    img3 = img3.astype(np.float32)
+    mn, mx = float(img3.min()), float(img3.max())
+    if mx > mn:
+        img3 = (img3 - mn) / (mx - mn)
+    else:
+        img3 = np.zeros_like(img3, dtype=np.float32)
+
+    t = torch.from_numpy(img3).permute(2, 0, 1).contiguous()  # (C,H,W)
+    return t
+
+
+def coco_bbox_xywh_to_xyxy(b: List[float]) -> List[float]:
+    x, y, w, h = b
+    return [x, y, x + w, y + h]
+
+
+def to_tensor_boxes_xyxy(boxes_xyxy: List[List[float]]) -> torch.Tensor:
+    if len(boxes_xyxy) == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    return torch.tensor(boxes_xyxy, dtype=torch.float32)
+
+
+def compute_image_iou_metric(
+    gt_boxes_xyxy: torch.Tensor,
+    pred_boxes_xyxy: torch.Tensor,
+    pred_scores: torch.Tensor,
+    score_thr: float = 0.3,
+) -> float:
+    """
+    Простая метрика на изображение: средний best-IoU для каждого GT (после фильтрации по score_thr).
+    Если GT нет: возвращаем 1.0 если предсказаний тоже нет, иначе 0.0.
+    """
+    if gt_boxes_xyxy.numel() == 0:
+        keep = pred_scores >= score_thr if pred_scores.numel() else torch.tensor([], dtype=torch.bool)
+        return 1.0 if keep.numel() == 0 or keep.sum().item() == 0 else 0.0
+
+    if pred_boxes_xyxy.numel() == 0:
+        return 0.0
+
+    keep = pred_scores >= score_thr
+    pb = pred_boxes_xyxy[keep] if keep.numel() else pred_boxes_xyxy
+    if pb.numel() == 0:
+        return 0.0
+
+    ious = box_iou(gt_boxes_xyxy, pb)  # (G,P)
+    best = ious.max(dim=1).values
+    return float(best.mean().item())
+
+
+# ---------------------------
+# class models
+# ---------------------------
+@dataclass
+class ModelWrap:
+    name: str
+    model: torch.nn.Module
+
+    def to(self, device: torch.device) -> "ModelWrap":
+        self.model.to(device)
+        return self
+
+    @torch.no_grad()
+    def infer_one(self, img_np: np.ndarray, score_thr: float = 0.3) -> Dict[str, Any]:
+        self.model.eval()
+        x = ensure_3ch_float01(img_np).to(DEVICE)
+        preds = self.model([x])[0]  # boxes, labels, scores
+        # torch -> python/cpu
+        out = {
+            "boxes": preds["boxes"].detach().cpu().numpy().tolist(),
+            "labels": preds["labels"].detach().cpu().numpy().tolist(),
+            "scores": preds["scores"].detach().cpu().numpy().tolist(),
+        }
+        # фильтрация
+        filt = [
+            (b, l, s)
+            for b, l, s in zip(out["boxes"], out["labels"], out["scores"])
+            if float(s) >= score_thr
+        ]
+        out["boxes"] = [x[0] for x in filt]
+        out["labels"] = [x[1] for x in filt]
+        out["scores"] = [x[2] for x in filt]
+        return out
+
+
+class models:
+    @staticmethod
+    def _load_partial_state_dict(model: torch.nn.Module, weights_path: str) -> None:
+        """
+        Загружает локальные веса "мягко": только совпадающие по ключу и размерности тензоры.
+        Это удобно, когда вы меняете head под свои num_classes.
+        """
+        if not os.path.isfile(weights_path):
+            raise FileNotFoundError(f"weights not found: {weights_path}")
+
+        sd = torch.load(weights_path, map_location="cpu", weights_only=True)
+        if isinstance(sd, dict) and "model_state_dict" in sd:
+            sd = sd["model_state_dict"]
+
+        msd = model.state_dict()
+        filtered = {}
+        for k, v in sd.items():
+            if k in msd and hasattr(v, "shape") and msd[k].shape == v.shape:
+                filtered[k] = v
+        msd.update(filtered)
+        model.load_state_dict(msd, strict=False)
+
+    @staticmethod
+    def _build_frcnn() -> torch.nn.Module:
+        m = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=None, num_classes=num_classes_with_bg)
+        # head уже под num_classes_with_bg, поэтому грузим частично (backbone+fpn+etc)
+        models._load_partial_state_dict(m, LOCAL_WEIGHTS["frcnn_resnet50_fpn"])
+        return m
+
+    @staticmethod
+    def _build_ssd300() -> torch.nn.Module:
+        m = torchvision.models.detection.ssd300_vgg16(weights=None, num_classes=num_classes_with_bg)
+        models._load_partial_state_dict(m, LOCAL_WEIGHTS["ssd300_vgg16"])
+        return m
+
+    @staticmethod
+    def _build_retinanet() -> torch.nn.Module:
+        m = torchvision.models.detection.retinanet_resnet50_fpn(weights=None, num_classes=num_classes_with_bg)
+        models._load_partial_state_dict(m, LOCAL_WEIGHTS["retinanet_resnet50_fpn"])
+        return m
+
+    @staticmethod
+    def get_my_models() -> List[ModelWrap]:
+        nets = [
+            ModelWrap("frcnn_resnet50_fpn", models._build_frcnn()),
+            ModelWrap("ssd300_vgg16", models._build_ssd300()),
+            ModelWrap("retinanet_resnet50_fpn", models._build_retinanet()),
+        ]
+        for w in nets:
+            w.to(DEVICE)
+        return nets
+
+
+# ---------------------------
+# class plots
+# ---------------------------
+class plots:
+    @staticmethod
+    def plot_eval_model(
+        img_np: np.ndarray,
+        bbox_gt_pgsql: Dict[str, Any],
+        bbox_pred_pgsql: Dict[str, Any],
+        save_path: str,
+        score_thr: float = 0.3,
+    ) -> float:
+        """
+        Сохраняет картинку с GT и Pred, возвращает метрику (mean best-IoU по GT).
+        bbox_*_pgsql: словарь "как хранится в pgsql" (ниже парсер старается быть терпимым).
+        """
+        gt = plots._parse_pgsql_bbox_to_xyxy_labels(bbox_gt_pgsql)
+        pr = plots._parse_pred_to_xyxy_labels_scores(bbox_pred_pgsql)
+
+        gt_boxes = to_tensor_boxes_xyxy(gt["boxes_xyxy"])
+        pr_boxes = to_tensor_boxes_xyxy(pr["boxes_xyxy"])
+        pr_scores = torch.tensor(pr["scores"], dtype=torch.float32) if len(pr["scores"]) else torch.zeros((0,))
+
+        metric = compute_image_iou_metric(gt_boxes, pr_boxes, pr_scores, score_thr=score_thr)
+
+        # draw
+        vis = plots._to_vis_uint8(img_np)
+        vis = plots._draw_boxes(vis, gt["boxes_xyxy"], gt["labels"], color=(0, 255, 0), prefix="GT")
+        vis = plots._draw_boxes(vis, pr["boxes_xyxy"], pr["labels"], color=(0, 0, 255), prefix="PR", scores=pr["scores"])
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        cv2.imwrite(save_path, vis)
+        return metric
+
+    @staticmethod
+    def get_class_types_from_excel(xlsx_path: str) -> Dict[str, Any]:
+        """
+        Ожидаем таблицу со столбцами примерно:
+        class, type, view, model, model_id
+        На выход: dict с цепочкой "класс->тип->вид->модель->номер".
+        """
+        df = pd.read_excel(xlsx_path)
+        req = ["class", "type", "view", "model", "model_id"]
+        miss = [c for c in req if c not in df.columns]
+        if miss:
+            raise ValueError(f"Excel must contain columns {req}, missing: {miss}")
+
+        out: Dict[str, Any] = {}
+        for _, r in df.iterrows():
+            c = str(r["class"]).strip()
+            t = str(r["type"]).strip()
+            v = str(r["view"]).strip()
+            m = str(r["model"]).strip()
+            mid = int(r["model_id"])
+            out.setdefault(c, {}).setdefault(t, {}).setdefault(v, {}).setdefault(m, set()).add(mid)
+        return out
+
+    @staticmethod
+    def get_coco_from_pandas(df: pd.DataFrame, class_types_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Создаёт COCO-словарь из pandas.
+        Предполагаем, что:
+          - df['id'] уникален на изображение
+          - df['rli_img_matrix'] содержит np.ndarray
+          - df['bbox'] содержит COCO-подобную разметку (list/dict)
+        """
+        images = []
+        annotations = []
+        ann_id = 1
+
+        categories = [{"id": CLASS_TO_ID[c], "name": c} for c in classes]
+
+        for _, row in df.iterrows():
+            img_id = int(row["id"])
+            img_np = row["rli_img_matrix"]
+            h, w = int(img_np.shape[0]), int(img_np.shape[1])
+
+            images.append({"id": img_id, "width": w, "height": h, "file_name": f"{img_id}.png"})
+
+            parsed = plots._parse_pgsql_bbox_to_xywh_catid(row["bbox"])
+            for bb in parsed:
+                # bb: {"bbox":[x,y,w,h], "category_id":int}
+                x, y, bw, bh = bb["bbox"]
+                annotations.append(
+                    {
+                        "id": ann_id,
+                        "image_id": img_id,
+                        "category_id": int(bb["category_id"]),
+                        "bbox": [float(x), float(y), float(bw), float(bh)],
+                        "area": float(bw * bh),
+                        "iscrowd": 0,
+                    }
+                )
+                ann_id += 1
+
+        coco = {"images": images, "annotations": annotations, "categories": categories}
+        return coco
+
+    # ---- internal helpers ----
+    @staticmethod
+    def _parse_pgsql_bbox_to_xywh_catid(bbox: Any) -> List[Dict[str, Any]]:
+        """
+        Возвращает список объектов COCO: [{"bbox":[x,y,w,h], "category_id":...}, ...]
+        Поддерживает частые варианты:
+          - dict с ключом "annotations"
+          - list[dict] уже как аннотации
+          - пустые/NaN
+        """
+        if bbox is None or (isinstance(bbox, float) and math.isnan(bbox)):
+            return []
+
+        if isinstance(bbox, str):
+            try:
+                bbox = json.loads(bbox)
+            except Exception:
+                return []
+
+        if isinstance(bbox, dict) and "annotations" in bbox:
+            anns = bbox.get("annotations", [])
+        elif isinstance(bbox, list):
+            anns = bbox
+        elif isinstance(bbox, dict) and ("bbox" in bbox or "boxes" in bbox):
+            anns = [bbox]
+        else:
+            return []
+
+        out = []
+        for a in anns:
+            if "bbox" in a and "category_id" in a:
+                out.append({"bbox": a["bbox"], "category_id": a["category_id"]})
+            elif "bbox" in a and "label" in a:
+                # label может быть "car"/"tank"/"other"
+                cid = CLASS_TO_ID.get(str(a["label"]), None)
+                if cid is not None:
+                    out.append({"bbox": a["bbox"], "category_id": cid})
+        return out
+
+    @staticmethod
+    def _parse_pgsql_bbox_to_xyxy_labels(bbox: Any) -> Dict[str, Any]:
+        anns = plots._parse_pgsql_bbox_to_xywh_catid(bbox)
+        boxes_xyxy, labels = [], []
+        for a in anns:
+            boxes_xyxy.append(coco_bbox_xywh_to_xyxy(a["bbox"]))
+            labels.append(int(a["category_id"]))
+        return {"boxes_xyxy": boxes_xyxy, "labels": labels}
+
+    @staticmethod
+    def _parse_pred_to_xyxy_labels_scores(pred: Any) -> Dict[str, Any]:
+        """
+        pred ожидается как:
+          {"boxes":[[x1,y1,x2,y2],...], "labels":[...], "scores":[...]}
+        либо строка JSON такого же вида.
+        """
+        if pred is None:
+            return {"boxes_xyxy": [], "labels": [], "scores": []}
+        if isinstance(pred, str):
+            try:
+                pred = json.loads(pred)
+            except Exception:
+                return {"boxes_xyxy": [], "labels": [], "scores": []}
+        boxes = pred.get("boxes", []) if isinstance(pred, dict) else []
+        labels = pred.get("labels", []) if isinstance(pred, dict) else []
+        scores = pred.get("scores", []) if isinstance(pred, dict) else []
+        return {"boxes_xyxy": boxes, "labels": labels, "scores": scores}
+
+    @staticmethod
+    def _to_vis_uint8(img_np: np.ndarray) -> np.ndarray:
+        if img_np.ndim == 2:
+            img3 = np.stack([img_np, img_np, img_np], axis=-1)
+        elif img_np.ndim == 3 and img_np.shape[2] == 1:
+            img3 = np.repeat(img_np, 3, axis=2)
+        else:
+            img3 = img_np.copy()
+
+        img3 = img3.astype(np.float32)
+        mn, mx = float(img3.min()), float(img3.max())
+        if mx > mn:
+            img3 = (img3 - mn) / (mx - mn)
+        img3 = (img3 * 255.0).clip(0, 255).astype(np.uint8)
+        return img3
+
+    @staticmethod
+    def _draw_boxes(
+        img: np.ndarray,
+        boxes_xyxy: List[List[float]],
+        labels: List[int],
+        color: Tuple[int, int, int],
+        prefix: str,
+        scores: Optional[List[float]] = None,
+    ) -> np.ndarray:
+        out = img.copy()
+        for i, b in enumerate(boxes_xyxy):
+            x1, y1, x2, y2 = map(int, map(round, b))
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            lab = labels[i] if i < len(labels) else -1
+            name = ID_TO_CLASS.get(lab, str(lab))
+            if scores is not None and i < len(scores):
+                txt = f"{prefix}:{name}:{scores[i]:.2f}"
+            else:
+                txt = f"{prefix}:{name}"
+            cv2.putText(out, txt, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        return out
+
+
+# ---------------------------
+# Dataset / DataLoader
+# ---------------------------
+class SarPandasDataset(torch.utils.data.Dataset):
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.reset_index(drop=True)
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        img_np = row["rli_img_matrix"]
+        bbox = row["bbox"]
+
+        img_t = ensure_3ch_float01(img_np)  # (3,H,W) float32
+
+        parsed = plots._parse_pgsql_bbox_to_xyxy_labels(bbox)
+        boxes = to_tensor_boxes_xyxy(parsed["boxes_xyxy"])
+        labels = torch.tensor(parsed["labels"], dtype=torch.int64) if len(parsed["labels"]) else torch.zeros((0,), dtype=torch.int64)
+
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "image_id": torch.tensor([int(row["id"])], dtype=torch.int64),
+        }
+        return img_t, target
+
+
+def collate_fn(batch):
+    images, targets = zip(*batch)
+    return list(images), list(targets)
+
+
+# ---------------------------
+# Train / Eval циклы
+# ---------------------------
+def train_one_epoch(model: torch.nn.Module, loader, optimizer, device: torch.device) -> float:
+    model.train()
+    total = 0.0
+    n = 0
+    for images, targets in loader:
+        images = [im.to(device) for im in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        loss_dict = model(images, targets)
+        loss = sum(loss_dict.values())
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        total += float(loss.item())
+        n += 1
+    return total / max(n, 1)
+
+
+@torch.no_grad()
+def eval_dataset_mean_iou(modelwrap: ModelWrap, df: pd.DataFrame, out_dir: str, tag: str) -> float:
+    os.makedirs(out_dir, exist_ok=True)
+    scores = []
+
+    for i, row in df.iterrows():
+        img_np = row["rli_img_matrix"]
+        gt_bbox = row["bbox"]
+
+        pred = modelwrap.infer_one(img_np, score_thr=0.3)
+        pred_pgsql_like = pred  # сохраняем в таком же dict-формате
+
+        save_path = os.path.join(out_dir, f"{tag}_{modelwrap.name}_{int(row['id'])}.png")
+        s = plots.plot_eval_model(
+            img_np=img_np,
+            bbox_gt_pgsql=gt_bbox,
+            bbox_pred_pgsql=pred_pgsql_like,
+            save_path=save_path,
+            score_thr=0.3,
+        )
+        scores.append(s)
+
+    return float(np.mean(scores)) if len(scores) else 0.0
+
+
+# ---------------------------
+# MAIN
+# ---------------------------
+if __name__ == "__main__":
+    # 0. Создание директорий
+    os.makedirs("models_eval", exist_ok=True)
+    os.makedirs("trained_models_eval", exist_ok=True)
+    os.makedirs("result", exist_ok=True)
+
+    # 1. Загрузка набора rli_images из pgsql (временно из pickle)
+    # rli_images = RadarImage().get_all_data()  # когда подключите PGSQL
+    rli_images = pd.read_pickle("data.pkl")
+
+    # Переименуем столбец под ваше описание (если у вас он называется иначе)
+    # В запросе вы упомянули rli_img_matrix, но в примере есть raw_img_matrix.
+    if "rli_img_matrix" not in rli_images.columns:
+        if "raw_img_matrix" in rli_images.columns:
+            rli_images = rli_images.rename(columns={"raw_img_matrix": "rli_img_matrix"})
+        else:
+            raise KeyError("Need column rli_img_matrix (or raw_img_matrix to rename).")
+
+    # Добавляем колонки под метрики
+    rli_images["eval_before_train"] = [{} for _ in range(len(rli_images))]
+    rli_images["eval_after_train"] = [{} for _ in range(len(rli_images))]
+
+    # 2. Разделение набора на ОН и ТН (train/test)
+    idx = np.arange(len(rli_images))
+    np.random.shuffle(idx)
+    split = int(0.8 * len(idx))
+    tr_idx, te_idx = idx[:split], idx[split:]
+    df_train = rli_images.iloc[tr_idx].reset_index(drop=True)
+    df_test = rli_images.iloc[te_idx].reset_index(drop=True)
+
+    # 3. Создание аннотаций ОН и ТН (COCO dict)
+    # class_types_dict = plots.get_class_types_from_excel("class_types.xlsx")  # когда будет Excel
+    class_types_dict = {}  # временно
+    coco_train = plots.get_coco_from_pandas(df_train, class_types_dict)
+    coco_test = plots.get_coco_from_pandas(df_test, class_types_dict)
+    with open("result/coco_train.json", "w", encoding="utf-8") as f:
+        json.dump(coco_train, f, ensure_ascii=False)
+    with open("result/coco_test.json", "w", encoding="utf-8") as f:
+        json.dump(coco_test, f, ensure_ascii=False)
+
+    # 4. Загрузка моделей
+    my_models = models.get_my_models()
+
+    # Конфиг обучения
+    EPOCHS = 2
+    BATCH = 2
+    LR = 1e-4
+
+    train_ds = SarPandasDataset(df_train)
+    test_df_for_eval = df_test  # оцениваем на тесте
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=BATCH, shuffle=True, collate_fn=collate_fn)
+
+    # 5. Статистическая оценка до обучения + обучение + оценка после
+    stats_rows = []
+    best_name = None
+    best_score = -1.0
+
+    for mw in my_models:
+        # eval BEFORE
+        mean_iou_before = eval_dataset_mean_iou(mw, test_df_for_eval, out_dir="models_eval", tag="before")
+        stats_rows.append({"model": mw.name, "mean_iou_before": mean_iou_before})
+
+        # finetune
+        optim = torch.optim.AdamW([p for p in mw.model.parameters() if p.requires_grad], lr=LR)
+        for ep in range(EPOCHS):
+            train_loss = train_one_epoch(mw.model, train_loader, optim, DEVICE)
+
+        # save trained weights
+        torch.save(mw.model.state_dict(), f"result/{mw.name}_finetuned.pth")
+
+        # eval AFTER
+        mean_iou_after = eval_dataset_mean_iou(mw, test_df_for_eval, out_dir="trained_models_eval", tag="after")
+
+        # обновляем таблицу
+        stats_rows[-1]["mean_iou_after"] = mean_iou_after
+
+        # best
+        if mean_iou_after > best_score:
+            best_score = mean_iou_after
+            best_name = mw.name
+
+    stats = pd.DataFrame(stats_rows)
+    stats.to_csv("result/metrics_summary.csv", index=False)
+
+    # 6. (по схеме) создать аннотацию методом get_coco_from_pandas — уже создано выше
+
+    # 7. Определить наилучшую модель и произвести оценку rli_images (заполнить dict-колонки)
+    # Для простоты: берём готовые mean_iou на test и заполняем per-image метрики в rli_images
+    best_model = [m for m in my_models if m.name == best_name][0]
+
+    for i, row in rli_images.iterrows():
+        img_np = row["rli_img_matrix"]
+        gt_bbox = row["bbox"]
+
+        pred_before = best_model.infer_one(img_np, score_thr=0.3)
+        s_before = plots.plot_eval_model(
+            img_np, gt_bbox, pred_before,
+            save_path=f"result/best_before_{best_model.name}_{int(row['id'])}.png",
+            score_thr=0.3
+        )
+
+        # Загрузим дообученные веса и повторим (чтобы именно best_after был корректен)
+        best_model.model.load_state_dict(torch.load(f"result/{best_model.name}_finetuned.pth", map_location="cpu", weights_only=True), strict=False)
+        best_model.model.to(DEVICE)
+
+        pred_after = best_model.infer_one(img_np, score_thr=0.3)
+        s_after = plots.plot_eval_model(
+            img_np, gt_bbox, pred_after,
+            save_path=f"result/best_after_{best_model.name}_{int(row['id'])}.png",
+            score_thr=0.3
+        )
+
+        d0 = dict(rli_images.at[i, "eval_before_train"])
+        d1 = dict(rli_images.at[i, "eval_after_train"])
+        d0[best_model.name] = s_before
+        d1[best_model.name] = s_after
+        rli_images.at[i, "eval_before_train"] = d0
+        rli_images.at[i, "eval_after_train"] = d1
+
+    rli_images.to_pickle("result/rli_images_with_eval.pkl")
+    print(f"Best model: {best_name}, mean_iou_after={best_score:.4f}")
